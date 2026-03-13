@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# media plugin for Andromeda - robust media search/play/download using yt-dlp & mpv
+# Usage: plugin media <mode> <query|url>
+# modes: search play audio video both download info playlist
+
+set -euo pipefail
+IFS=$'\n\t'
+
+MODE="${1:-}"
+shift || true
+# combine rest to a single query; remove surrounding quotes if present
+RAW_QUERY="${*:-}"
+
+unquote() {
+  local s="$*"
+  # remove surrounding single or double quotes if present
+  s="${s#\"}"; s="${s%\"}"
+  s="${s#\'}"; s="${s%\'}"
+  printf "%s" "$s"
+}
+
+QUERY="$(unquote "$RAW_QUERY")"
+DOWNLOAD_DIR="${HOME}/Downloads/andromeda_media"
+YT_DLP="${YT_DLP:-yt-dlp}"
+MPV="${MPV:-mpv}"
+MKDIR_PFX=1
+
+mkdir -p "$DOWNLOAD_DIR"/{Audio,Video,Temp} >/dev/null 2>&1 || true
+
+info(){ printf "[media] %s\n" "$*"; }
+err(){ printf "[media][ERROR] %s\n" "$*" >&2; }
+
+is_url(){
+  printf "%s" "$1" | grep -qE '^https?://'
+}
+
+# Resolve a query or URL to a youtube watch URL (best-effort).
+# Returns 0 + prints URL to stdout on success, else returns 1.
+resolve_to_youtube_url(){
+  local q="$1"
+  # if q already a youtube url or youtu.be -> return it
+  if printf "%s" "$q" | grep -qE '^(https?://)?(www\.)?(youtube\.com|youtu\.be)'; then
+    # ensure it includes scheme
+    if printf "%s" "$q" | grep -qE '^https?://'; then printf "%s" "$q"; else printf "https://%s" "$q"; fi
+    return 0
+  fi
+
+  # If it's any other URL, fail
+  if is_url "$q"; then return 1; fi
+
+  # Use yt-dlp to perform ytsearch and return the video id (first match)
+  if command -v "$YT_DLP" >/dev/null 2>&1; then
+    # --skip-download --get-id on ytsearch1 will print the video id (or nothing)
+    local vid
+    vid=$("$YT_DLP" --skip-download --get-id "ytsearch1:$q" 2>/dev/null || true)
+    vid="$(printf "%s" "$vid" | sed -n '1p' || true)"
+    if [[ -n "$vid" ]]; then
+      printf "https://www.youtube.com/watch?v=%s" "$vid"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+# Print usage
+usage(){
+  cat <<EOF
+Usage: plugin media <mode> <query|url>
+Modes:
+  search <query>       - show top 5 YouTube matches (title + URL)
+  play <query|url>     - stream (mpv preferred) - supports queries and URLs
+  audio <query|url>    - download audio (mp3) to $DOWNLOAD_DIR/Audio
+  video <query|url>    - download video to $DOWNLOAD_DIR/Video
+  both|download <q>    - download best video+audio, mux to mp4
+  info <url>           - show available formats (yt-dlp -F)
+  playlist <playlist-url> - download playlist to Playlists/
+EOF
+}
+
+# show search results (yt-dlp based)
+do_search(){
+  if [[ -z "$QUERY" ]]; then usage; exit 1; fi
+  info "Searching (yt-dlp ytsearch) for: $QUERY"
+  if ! command -v "$YT_DLP" >/dev/null 2>&1; then err "yt-dlp not found; install it (pipx install yt-dlp)"; exit 2; fi
+  # Print numbered list: title - youtube url
+  # yt-dlp "ytsearch5:QUERY" --get-title --get-id prints title then id lines alternating.
+  "$YT_DLP" "ytsearch5:$QUERY" --get-title --get-id 2>/dev/null | awk 'NR%2==1{t=$0; next} NR%2==0{print NR/2 ") " t " — https://www.youtube.com/watch?v="$0}'
+}
+
+# play: prefer resolved youtube url, otherwise attempt mpv ytsearch fallback
+do_play(){
+  if [[ -z "$QUERY" ]]; then usage; exit 1; fi
+
+  local url
+  if resolve_to_youtube_url "$QUERY" >/dev/null 2>&1; then
+    url="$(resolve_to_youtube_url "$QUERY")"
+  fi
+
+  if [[ -n "${url:-}" ]]; then
+    info "Resolved target: $url"
+    if command -v "$MPV" >/dev/null 2>&1; then
+      info "Streaming via mpv"
+      "$MPV" --ytdl=yes --ytdl-format=best "$url"
+      return 0
+    fi
+    # mpv missing, try yt-dlp to download temp and play (if mpv available as playback command)
+    if command -v "$YT_DLP" >/dev/null 2>&1; then
+      info "mpv not found — downloading temporary file and attempting to play with mpv if available"
+      tmpd="$(mktemp -d "$DOWNLOAD_DIR/Temp/andromeda.XXXX")"
+      "$YT_DLP" -f best -o "$tmpd/%(title)s.%(ext)s" "$url"
+      recent=$(find "$tmpd" -type f -print0 | xargs -0 ls -1t 2>/dev/null | head -n1 || true)
+      if [[ -n "$recent" && -n "$(command -v mpv || true)" ]]; then
+        mpv "$recent"
+      else
+        info "Downloaded to: $tmpd (no mpv found to play)"
+      fi
+      rm -rf "$tmpd"
+      return 0
+    fi
+    err "Neither mpv nor yt-dlp available to play URL"
+    return 2
+  else
+    # fallback: use mpv's ytsearch if mpv exists
+    if command -v "$MPV" >/dev/null 2>&1; then
+      info "No direct YouTube id found — using mpv ytsearch fallback"
+      "$MPV" --ytdl=yes --ytdl-format=best "ytsearch1:$QUERY"
+      return 0
+    fi
+    # fallback: use yt-dlp to download first result then play if possible
+    if command -v "$YT_DLP" >/dev/null 2>&1; then
+      info "No mpv available — downloading first search result"
+      tmpd="$(mktemp -d "$DOWNLOAD_DIR/Temp/andromeda.XXXX")"
+      "$YT_DLP" -f best -o "$tmpd/%(title)s.%(ext)s" "ytsearch1:$QUERY"
+      recent=$(find "$tmpd" -type f -print0 | xargs -0 ls -1t 2>/dev/null | head -n1 || true)
+      if [[ -n "$recent" ]]; then
+        if command -v mpv >/dev/null 2>&1; then mpv "$recent"; else info "Downloaded to: $recent"; fi
+      else
+        err "No result downloaded."
+      fi
+      rm -rf "$tmpd"
+      return 0
+    fi
+    err "No way to stream: mpv and yt-dlp not found"
+    return 3
+  fi
+}
+
+# download audio (mp3)
+do_audio(){
+  if [[ -z "$QUERY" ]]; then usage; exit 1; fi
+  if ! command -v "$YT_DLP" >/dev/null 2>&1; then err "yt-dlp not found"; exit 2; fi
+  info "Downloading audio for: $QUERY"
+  mkdir -p "$DOWNLOAD_DIR/Audio"
+  # if query is URL, use it; else feed ytsearch1:
+  if is_url "$QUERY"; then
+    "$YT_DLP" -x --audio-format mp3 --audio-quality 0 --add-metadata -o "$DOWNLOAD_DIR/Audio/%(title)s.%(ext)s" "$QUERY"
+  else
+    "$YT_DLP" -x --audio-format mp3 --audio-quality 0 --add-metadata -o "$DOWNLOAD_DIR/Audio/%(title)s.%(ext)s" "ytsearch1:$QUERY"
+  fi
+  info "Saved to: $DOWNLOAD_DIR/Audio"
+}
+
+# download video
+do_video(){
+  if [[ -z "$QUERY" ]]; then usage; exit 1; fi
+  if ! command -v "$YT_DLP" >/dev/null 2>&1; then err "yt-dlp not found"; exit 2; fi
+  info "Downloading video for: $QUERY"
+  mkdir -p "$DOWNLOAD_DIR/Video"
+  if is_url "$QUERY"; then
+    "$YT_DLP" -f bestvideo+bestaudio/best --add-metadata -o "$DOWNLOAD_DIR/Video/%(title)s.%(ext)s" "$QUERY"
+  else
+    "$YT_DLP" -f bestvideo+bestaudio/best --add-metadata -o "$DOWNLOAD_DIR/Video/%(title)s.%(ext)s" "ytsearch1:$QUERY"
+  fi
+  info "Saved to: $DOWNLOAD_DIR/Video"
+}
+
+do_both(){
+  # alias for download
+  do_video
+}
+
+do_info(){
+  if [[ -z "$QUERY" ]]; then usage; exit 1; fi
+  if ! command -v "$YT_DLP" >/dev/null 2>&1; then err "yt-dlp not found"; exit 2; fi
+  if is_url "$QUERY"; then
+    "$YT_DLP" -F "$QUERY" || true
+  else
+    info "Showing formats for first search result:"
+    id=$("$YT_DLP" --skip-download --get-id "ytsearch1:$QUERY" 2>/dev/null | sed -n '1p' || true)
+    if [[ -n "$id" ]]; then
+      "$YT_DLP" -F "https://www.youtube.com/watch?v=$id" || true
+    else
+      err "Could not resolve first search result to show info."
+      exit 3
+    fi
+  fi
+}
+
+do_playlist(){
+  if [[ -z "$QUERY" ]]; then usage; exit 1; fi
+  mkdir -p "$DOWNLOAD_DIR/Playlists"
+  if ! command -v "$YT_DLP" >/dev/null 2>&1; then err "yt-dlp not found"; exit 2; fi
+  info "Downloading playlist (may create subfolder)..."
+  "$YT_DLP" -o "$DOWNLOAD_DIR/Playlists/%(playlist_title)s/%(title)s.%(ext)s" "$QUERY"
+}
+
+case "${MODE,,}" in
+  search) do_search ;;
+  play) do_play ;;
+  audio) do_audio ;;
+  video) do_video ;;
+  both|download) do_both ;;
+  info) do_info ;;
+  playlist) do_playlist ;;
+  *) usage; exit 1 ;;
+esac
